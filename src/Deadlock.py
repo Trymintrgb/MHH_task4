@@ -1,190 +1,161 @@
-import collections
-from typing import Tuple, List, Optional
-from pyeda.inter import *
-from collections import deque
-from .PetriNet import PetriNet
+from typing import List, Optional
 import numpy as np
+import pulp
+import itertools
+from pyeda.inter import BinaryDecisionDiagram
+
+# keep your earlier helpers: _normalize_matrices, _parse_bdd_assignment, _is_transition_enabled_for_marking, etc.
 
 def deadlock_reachable_marking(
-    pn: PetriNet, 
-    bdd: BinaryDecisionDiagram, 
+    pn,
+    reach_bdd: BinaryDecisionDiagram,
+    max_enumerate: int = 2000,
 ) -> Optional[List[int]]:
     """
-    Combine a lightweight ILP (state equation solver via bounded integer search)
-    with BDD: iterate satisfying assignments of `bdd`, for each marking that is dead:
-      1) try to solve C x = M - M0 for integer x >= 0 (bounded search),
-      2) if solution x found, try to construct an actual firing sequence (backtracking)
-         that uses exactly the counts in x and leads from M0 to M.
-    Return the first reachable dead marking found as a list of ints, or None.
+    Optimized hybrid: enumerate reachable markings from BDD (expand don't-cares),
+    precompute enabled[t][k], then solve small ILP over y_k selecting exactly one
+    reachable marking that disables all transitions.
+
+    If the BDD expands to more than `max_enumerate` markings, we bail out (or
+    optionally fall back to a different ILP strategy).
     """
-    # Prepare place variable names in the same order as pn.place_ids
-    place_names = pn.place_ids
-    place_vars = [exprvar(name) for name in place_names]
+    # quick reject
+    try:
+        if reach_bdd.is_zero():
+            return None
+    except Exception:
+        # if BDD doesn't provide is_zero, continue and rely on satisfy_all
+        pass
 
-    P = len(pn.place_ids)
-    T = len(pn.trans_ids)
-    # C matrix: change = O - I, shape (places, transitions)
-    C = (pn.O - pn.I).astype(int)
+    # Normalize matrices to canonical I (P x T), O (P x T), M0 (P,)
+    I_mat, O_mat, M0 = _normalize_matrices(pn)  # I_mat: P x T
+    P = I_mat.shape[0]
+    T = I_mat.shape[1]
 
-    M0 = np.array(pn.M0, dtype=int)
+    # But many BDD-based codes use transitions x places orientation (T x P)
+    # We'll use I_t (T x P) and O_t (T x P) for enabled checks like friend's code
+    I_t = I_mat.T.copy()  # shape (T, P)
+    O_t = O_mat.T.copy()  # shape (T, P)
 
-    # Helper: build marking list from assignment returned by bdd.satisfy_all()
-    def assign_to_marking(assign) -> Optional[np.ndarray]:
-        marking = []
-        for var in place_vars:
-            # assign keys in pyeda may be Var objects or names
-            val = assign.get(var, None)
-            if val is None:
-                val = assign.get(var.name, None)
-            if val is None:
-                # if missing variable mapping, fail (shouldn't happen)
-                return None
-            marking.append(int(bool(val)))
-        return np.array(marking, dtype=int)
+    place_ids = pn.place_ids  # names in BDD are expected to match these (strings)
 
-    # Check dead: no transition enabled at marking
-    def is_dead(marking: np.ndarray) -> bool:
-        for t_idx in range(T):
-            # enabled if all input places have token
-            if np.all(marking >= pn.I[:, t_idx]):
-                return False
-        return True
+    # ---------------------------------------------------------
+    # 1) Enumerate reachable markings from BDD (expand don't-cares)
+    # ---------------------------------------------------------
+    support_vars = list(reach_bdd.support) if hasattr(reach_bdd, "support") else []
+    name_to_var = {v.name: v for v in support_vars}
+    support_names = set(name_to_var.keys())
 
-    # Solve C x = rhs (rhs = M - M0) for integer x >=0 using bounded backtracking
-    def solve_state_equation(rhs: np.ndarray) -> Optional[List[int]]:
-        # Quick feasibility: rhs must be integer vector
-        rhs = rhs.astype(int)
+    # places missing from the BDD support (don't-care places)
+    missing_place_ids = [pid for pid in place_ids if pid not in support_names]
 
-        # Choose an upper bound for each transition's firing count.
-        # Heuristic bound: max_fire = 1 + sum(abs(rhs)) + len(P)
-        # (keeps search limited; can be tuned)
-        max_fire = int(1 + np.sum(np.abs(rhs)) + P)
-        # But also avoid excessive bound for large nets
-        max_fire = min(max_fire, 8 + P)  # cap to reasonable number
+    reachable_markings_set = set()
+    reachable_markings: List[List[int]] = []
 
-        # Precompute for pruning: for remaining transitions, the min and max contributions
-        C_int = C.astype(int)  # shape (P, T)
-
-        # DFS with pruning
-        solution = [0] * T
-        memo_prune = {}
-
-        def dfs(k: int, partial: np.ndarray) -> bool:
-            # partial = sum_{i<k} C[:,i] * solution[i]
-            if k == T:
-                # check equality
-                return np.array_equal(partial, rhs)
-            key = (k, tuple(partial.tolist()))
-            if key in memo_prune:
-                return False
-            # compute residual we need from remaining variables
-            residual = rhs - partial  # shape (P,)
-            # compute possible min/max from remaining transitions with bounds [0, max_fire]
-            # min_possible = sum_j min(0, C[:,j])*max_fire, max_possible = sum_j max(0,C[:,j])*max_fire
-            rem_min = np.zeros(P, dtype=int)
-            rem_max = np.zeros(P, dtype=int)
-            for j in range(k, T):
-                col = C_int[:, j]
-                # positive contributions
-                pos = np.maximum(0, col)
-                neg = np.minimum(0, col)
-                rem_max += pos * max_fire
-                rem_min += neg * max_fire
-            # prune: residual must be within [rem_min, rem_max]
-            if np.any(residual < rem_min) or np.any(residual > rem_max):
-                memo_prune[key] = False
-                return False
-            # try possible counts for variable k
-            # We can compute tighter bounds for variable k by solving per-place constraints:
-            # For each place i: col_i * x_k must be between (residual_i - rem_{others}_max) and (residual_i - rem_{others}_min)
-            # For simplicity, use global 0..max_fire
-            for val in range(0, max_fire + 1):
-                solution[k] = val
-                new_partial = partial + C_int[:, k] * val
-                # small pruning: check if new_partial not exceeding rhs beyond possible remaining
-                # compute remaining min/max for j>k
-                rem_min2 = np.zeros(P, dtype=int)
-                rem_max2 = np.zeros(P, dtype=int)
-                for j in range(k+1, T):
-                    col = C_int[:, j]
-                    rem_max2 += np.maximum(0, col) * max_fire
-                    rem_min2 += np.minimum(0, col) * max_fire
-                residual2 = rhs - new_partial
-                if np.any(residual2 < rem_min2) or np.any(residual2 > rem_max2):
-                    continue
-                if dfs(k+1, new_partial):
-                    return True
-            memo_prune[key] = False
-            return False
-
-        start_partial = np.zeros(P, dtype=int)
-        ok = dfs(0, start_partial)
-        if ok:
-            return solution.copy()
+    # satisfy_all might be generator of dicts mapping var->0/1
+    try:
+        sat_iter = reach_bdd.satisfy_all()
+    except Exception:
+        # If BDD doesn't implement satisfy_all, give up
         return None
 
-    # Given vector x (counts per transition), try to construct an actual firing sequence
-    # using exactly x counts, by backtracking trying enabled transitions.
-    def construct_firing_sequence(M_target: np.ndarray, x_counts: List[int]) -> Optional[List[int]]:
-        x_counts = [int(v) for v in x_counts]
-        total_fires = sum(x_counts)
-        # memoization set for (marking_tuple, tuple(counts_remaining))
-        memo = set()
+    for assignment in sat_iter:
+        # assignment: {var: 0/1}
+        base_assign = {getattr(v, "name", str(v)): int(bool(val)) for v, val in assignment.items()}
 
-        def bt(cur_marking: Tuple[int, ...], counts_remaining: Tuple[int, ...]) -> Optional[List[int]]:
-            if (cur_marking, counts_remaining) in memo:
-                return None
-            # if all counts done, check equality with target marking
-            if sum(counts_remaining) == 0:
-                if np.array_equal(np.array(cur_marking, dtype=int), M_target):
-                    return []
-                else:
-                    memo.add((cur_marking, counts_remaining))
-                    return None
-            cur = np.array(cur_marking, dtype=int)
-            # try every transition with remaining count > 0 and enabled
-            for t_idx in range(T):
-                if counts_remaining[t_idx] <= 0:
-                    continue
-                if np.all(cur >= pn.I[:, t_idx]):
-                    nxt = cur - pn.I[:, t_idx] + pn.O[:, t_idx]
-                    nxt = np.clip(nxt, 0, 1)
-                    new_counts = list(counts_remaining)
-                    new_counts[t_idx] -= 1
-                    res = bt(tuple(nxt.tolist()), tuple(new_counts))
-                    if res is not None:
-                        return [t_idx] + res
-            memo.add((cur_marking, counts_remaining))
+        if not missing_place_ids:
+            full_assign = base_assign
+            m_vec = [full_assign.get(pid, 0) for pid in place_ids]
+            t = tuple(m_vec)
+            if t not in reachable_markings_set:
+                reachable_markings_set.add(t)
+                reachable_markings.append(m_vec)
+        else:
+            # expand don't-care places
+            for bits in itertools.product([0, 1], repeat=len(missing_place_ids)):
+                extra = dict(zip(missing_place_ids, bits))
+                full_assign = dict(base_assign)
+                full_assign.update(extra)
+                m_vec = [full_assign.get(pid, 0) for pid in place_ids]
+                t = tuple(m_vec)
+                if t not in reachable_markings_set:
+                    reachable_markings_set.add(t)
+                    reachable_markings.append(m_vec)
+
+        # safety cutoff while enumerating
+        if len(reachable_markings) > max_enumerate:
+            # too many markings to enumerate; fallback or bail out
+            # For now, bail out (you can instead call the earlier ILP-on-x fallback).
             return None
 
-        seq = bt(tuple(M0.tolist()), tuple(x_counts))
-        return seq
-
-    # Iterate satisfying assignments of provided BDD
-    # pyeda's satisfy_all returns dicts mapping vars (or names) to 0/1
-    try:
-        sat_iter = bdd.satisfy_all()
-    except Exception:
-        # if bdd is not iterable or empty
+    K = len(reachable_markings)
+    if K == 0:
         return None
 
-    for assign in sat_iter:
-        marking = assign_to_marking(assign)
-        if marking is None:
-            continue
-        # Only consider dead markings
-        if not is_dead(marking):
-            continue
-        # Solve state equation: C x = M - M0
-        rhs = (marking - M0).astype(int)
-        x = solve_state_equation(rhs)
-        if x is None:
-            # no integer solution under the bounds
-            continue
-        # attempt to build firing sequence of counts x
-        seq = construct_firing_sequence(marking, x)
-        if seq is not None:
-            # Found reachable dead marking
-            return [int(v) for v in marking.tolist()]
+    reachable_arr = np.array(reachable_markings, dtype=int)  # K x P
 
-    return None
+    # ---------------------------------------------------------
+    # 2) Precompute enabled[t][k]
+    # ---------------------------------------------------------
+    n_trans = T
+    n_places = P
+    enabled = np.zeros((n_trans, K), dtype=int)
+
+    # For each marking k and transition t:
+    #  - enough tokens: reachable_arr[k] >= I_t[t]
+    #  - next marking M' = M - I_t[t] + O_t[t] is in reachable set
+    for t in range(n_trans):
+        need = I_t[t]  # (P,)
+        ok1 = (reachable_arr >= need).all(axis=1)  # shape (K,)
+
+        M_next = reachable_arr - need + O_t[t]  # (K,P)
+        ok2 = np.array([tuple(M_next[k].tolist()) in reachable_markings_set for k in range(K)])
+
+        enabled[t] = (ok1 & ok2).astype(int)
+
+    # If there exists a marking k such that for every t enabled[t,k] == 0, we already
+    # have a dead reachable marking — ILP will find it quickly, but we can quick-check:
+    for k in range(K):
+        if enabled[:, k].sum() == 0:
+            return [int(x) for x in reachable_markings[k]]
+
+    # ---------------------------------------------------------
+    # 3) ILP: pick exactly one reachable marking y_k (binary) such that
+    #    for all t: sum_k enabled[t,k] * y_k == 0
+    # ---------------------------------------------------------
+    prob = pulp.LpProblem("Deadlock_On_Reachable", pulp.LpMinimize)
+    y = [pulp.LpVariable(f"y_{k}", lowBound=0, upBound=1, cat="Binary") for k in range(K)]
+
+    # select exactly one marking
+    prob += pulp.lpSum(y[k] for k in range(K)) == 1
+
+    # prevent any transition from being enabled at the chosen marking
+    for t in range(n_trans):
+        # sum(enabled[t][k] * y_k) == 0
+        if enabled[t].sum() > 0:
+            prob += pulp.lpSum(enabled[t][k] * y[k] for k in range(K)) == 0
+        # if enabled[t].sum() == 0 then constraint is redundant (already covered above by quick-check)
+
+    # objective: dummy (minimize number of picked markings — always 1). CBC needs objective.
+    prob += 0
+
+    # Solve with small time limit and silent mode
+    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=10)
+    status = prob.solve(solver)
+
+    if pulp.LpStatus[status] not in ("Optimal", "Feasible"):
+        return None
+
+    # extract chosen marking
+    chosen_k = None
+    for k in range(K):
+        val = y[k].value()
+        if val is not None and val > 0.5:
+            chosen_k = k
+            break
+
+    if chosen_k is None:
+        return None
+
+    # final sanity: return marking as list[int]
+    return [int(x) for x in reachable_markings[chosen_k]]
