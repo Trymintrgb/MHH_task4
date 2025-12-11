@@ -1,47 +1,72 @@
-# TASK 4 BTL MHH
+# MHH Task 4 – Deadlock Detection
 
-**Deadlock detection by using ILP and BDD:** Combine ILP formulation and the
-BDD obtained in Task 3 to detect a deadlock if it exists. More specifically, output one
-deadlock if found, otherwise report none. Note that a dead marking is a marking where
-no transition is enabled, whereas a deadlock is a dead marking that is reachable from the
-initial marking [17]. Report the running time on some example models.
+This repository implements **deadlock detection by using ILP and BDD**. The goal is to report whether a deadlock exists in a given Petri net model — and if so, output one example deadlock marking. :contentReference[oaicite:1]{index=1}
 
-## Requirements
+---
 
-- Tạo môi trường ảo (virtual environment)
-```
+## 📌 Overview
+
+In this task:
+
+- A deadlock is a reachable marking where no transition is enabled.
+- A dead marking is any marking where no transition is enabled.
+- We combine an **Integer Linear Programming (ILP)** formulation with the **Binary Decision Diagram (BDD)** from previous tasks to perform detection. :contentReference[oaicite:2]{index=2}
+
+---
+
+## 🧰 Requirements
+
+Before running the code, set up a Python virtual environment:
+
+```bash
 python3 -m venv venv
-```
+Activate the virtual environment:
 
-- Kích hoạt môi trường ảo
-```
+bash
+Copy code
 # Windows
 venv\Scripts\Activate.ps1
 
-# Linux / macOS:
+# Linux / macOS
 source venv/bin/activate
-```
+Then install requirements:
 
-- Cài đặt các thư viện từ `requirements.txt`
-```
+bash
+Copy code
 pip install -r requirements.txt
-```
+▶️ Running the Project
+To run all tests with detailed output:
 
-
-##  Running tests
-
-- Run all tests
-```
+bash
+Copy code
 python3 -m pytest -vv test_Deadlock.py
-```
+To run a single specific test:
 
-- Run a single test function
-
-```
+bash
+Copy code
 python3 -m pytest -vv test_Deadlock.py::test_001
-```
+🖼️ Result Example
+Below is an example of the result image showing the detection output.
+Replace assets/result.png with the path to your actual image file.
 
----
+md
+Copy code
+![Deadlock Detection Result](assets/result.png)
+👉 If your image is stored elsewhere, update the path or link accordingly.
+
+📄 File Structure
+Your project contains:
+
+arduino
+Copy code
+├── src/
+├── BTL_MHH.pdf
+├── run.py
+├── test_Deadlock.py
+├── requirements.txt
+├── README.md
+📞 Contact
+If you have questions or find issues, feel free to open an Issue on GitHub.
 <p align="center">
   <a href="https://www.facebook.com/Shiba.Vo.Tien">
     <img src="https://img.shields.io/badge/Facebook-1877F2?style=for-the-badge&logo=facebook&logoColor=white" alt="Facebook"/>
