@@ -2,9 +2,7 @@
 
 **Deadlock detection using ILP and BDD:**  
 This task combines an ILP formulation with the BDD built in Task 3 to detect whether a deadlock exists.  
-If a deadlock is reachable from the initial marking, return one concrete deadlock marking; otherwise, report that none exists.  
-A *dead marking* is one where no transition is enabled; a *deadlock* is a dead marking reachable from the initial marking.  
-You must also report running time for several example models.
+If a deadlock is reachable from the initial marking, return one concrete deadlock marking; otherwise, report that none exists.
 
 ---
 
@@ -35,10 +33,9 @@ bash
 Copy code
 python3 -m pytest -vv test_Deadlock.py::test_001
 🖼️ Result Image (Insert Your Output Here)
-Upload your result image into the repository (for example into a folder called assets/)
-and place the line below after replacing the path with your actual image:
+Upload your result image to the repository (e.g., into assets/result.png)
+then reference it like this:
 
 md
 Copy code
 ![Deadlock Detection Result](assets/result.png)
-Or use a raw GitHub link if you prefer.
